@@ -3,12 +3,19 @@
   "version": "3.9.7",
   "description": "JavaScript implementation of the Simple Network Management Protocol (SNMP)",
   "main": "index.js",
+  "browser": {
+    "net": false,
+    "dgram": "weintek-emitter"
+  },
   "directories": {
     "example": "example"
   },
   "dependencies": {
     "asn1-ber": "^1.2.1",
-    "smart-buffer": "^4.1.0"
+    "crypto-js": "^4.1.1",
+    "randombytes-shim": "^0.0.3",
+    "smart-buffer": "^4.1.0",
+    "weintek-emitter": "file:../weintek-emitter"
   },
   "devDependencies": {
     "eslint": "^5.16.0",
