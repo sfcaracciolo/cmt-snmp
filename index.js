@@ -7,7 +7,9 @@ var dgram = require ("dgram");
 var net = require ("net");
 var events = require ("events");
 var util = require ("util");
-var crypto = require ("crypto");
+var CryptoJS = require("crypto-js");
+var crypto = require("crypto");
+var randomBytes = require("randombytes-shim");
 var mibparser = require ("./lib/mib");
 var DEBUG = false;
 
@@ -273,14 +275,14 @@ function ResponseInvalidError (message, code, info) {
 	this.message = message;
 	this.code = code;
 	this.info = info;
-	Error.captureStackTrace(this, ResponseInvalidError);
+	// Error.captureStackTrace(this, ResponseInvalidError);
 }
 util.inherits (ResponseInvalidError, Error);
 
 function RequestInvalidError (message) {
 	this.name = "RequestInvalidError";
 	this.message = message;
-	Error.captureStackTrace(this, RequestInvalidError);
+	// Error.captureStackTrace(this, RequestInvalidError);
 }
 util.inherits (RequestInvalidError, Error);
 
@@ -288,14 +290,14 @@ function RequestFailedError (message, status) {
 	this.name = "RequestFailedError";
 	this.message = message;
 	this.status = status;
-	Error.captureStackTrace(this, RequestFailedError);
+	// Error.captureStackTrace(this, RequestFailedError);
 }
 util.inherits (RequestFailedError, Error);
 
 function RequestTimedOutError (message) {
 	this.name = "RequestTimedOutError";
 	this.message = message;
-	Error.captureStackTrace(this, RequestTimedOutError);
+	// Error.captureStackTrace(this, RequestTimedOutError);
 }
 util.inherits (RequestTimedOutError, Error);
 
@@ -305,7 +307,7 @@ function ProcessingError (message, error, rinfo, buffer) {
 	this.error = error;
 	this.rinfo = rinfo;
 	this.buffer = buffer;
-	Error.captureStackTrace(this, ProcessingError);
+	// Error.captureStackTrace(this, ProcessingError);
 }
 util.inherits (ProcessingError, Error);
 
@@ -725,7 +727,7 @@ TrapPdu.prototype.toBuffer = function (buffer) {
 	writeInt32 (buffer, ObjectType.Integer, this.generic);
 	writeInt32 (buffer, ObjectType.Integer, this.specific);
 	writeUint32 (buffer, ObjectType.TimeTicks,
-			this.upTime || Math.floor (process.uptime () * 100));
+			this.upTime || 0);
 
 	writeVarbinds (buffer, this.varbinds);
 
@@ -1137,7 +1139,7 @@ Encryption.encryptPduDes = function (scopedPdu, privProtocol, privPassword, auth
 	// set local SNMP engine boots part of salt to 1, as we have no persistent engine state
 	salt.fill ('00000001', 0, 4, 'hex');
 	// set local integer part of salt to random
-	salt.fill (crypto.randomBytes (4), 4, 8);
+	salt.fill (randomBytes (4), 4, 8);
 	iv = Buffer.alloc (des.BLOCK_LENGTH);
 	for (i = 0; i < iv.length; i++) {
 		iv[i] = preIv[i] ^ salt[i];
@@ -1183,14 +1185,35 @@ Encryption.decryptPduDes = function (encryptedPdu, privProtocol, privParameters,
 	for (i = 0; i < iv.length; i++) {
 		iv[i] = preIv[i] ^ salt[i];
 	}
-	
-	decipher = crypto.createDecipheriv (des.CRYPTO_ALGORITHM, decryptionKey, iv);
-	decipher.setAutoPadding(false);
-	decryptedPdu = decipher.update (encryptedPdu);
-	decryptedPdu = Buffer.concat ([decryptedPdu, decipher.final()]);
+
+	// console.log('key: ' + decryptionKey.toString('hex'))
+	// console.log('iv: ' + iv.toString('hex'))
+	// console.log('encrypted: ' + encryptedPdu.toString('hex'))
+
+	// ONLY ON HMI final() cause an error: Failed to decrypt PDU: Error: Assertion failed: undefined != 166 
+	// So we use crypto-js insead crypto for this propose
+	// decipher = crypto.createDecipheriv (des.CRYPTO_ALGORITHM, decryptionKey, iv);
+	// decipher.setAutoPadding(false);
+	// decryptedPdu = decipher.update (encryptedPdu);
+	// decryptedPdu = Buffer.concat ([decryptedPdu, decipher.final()]); 
+	// console.log('decrypted: ' + decryptedPdu.toString('hex'))
 	// Encryption.debugDecrypt (decryptionKey, iv, encryptedPdu, decryptedPdu);
 
-	return decryptedPdu;
+	// new way with CryptoJS
+	decipher = CryptoJS.DES.decrypt(
+		{
+			ciphertext: CryptoJS.enc.Hex.parse(encryptedPdu.toString('hex'))
+		},
+		CryptoJS.enc.Hex.parse(decryptionKey.toString('hex')),
+		{
+			padding: CryptoJS.pad.NoPadding,
+			mode: CryptoJS.mode.CBC,
+			iv: CryptoJS.enc.Hex.parse(iv.toString('hex'))
+		})
+	// console.log('decrypted: ' + decipher.toString(CryptoJS.enc.Hex))
+	
+	return Buffer.from(decipher.toString(CryptoJS.enc.Hex), 'hex');
+	// return decryptedPdu
 };
 
 Encryption.generateIvAes = function (aes, engineBoots, engineTime, salt) {
@@ -1221,7 +1244,7 @@ Encryption.encryptPduAes = function (scopedPdu, privProtocol, privPassword, auth
 	var encryptedPdu;
 
 	encryptionKey = localizationAlgorithm (aes, authProtocol, privPassword, engine.engineID);
-	salt = Buffer.alloc (8).fill (crypto.randomBytes (8), 0, 8);
+	salt = Buffer.alloc (8).fill (randomBytes (8), 0, 8);
 	iv = Encryption.generateIvAes (aes, engine.engineBoots, engine.engineTime, salt);
 	cipher = crypto.createCipheriv (aes.CRYPTO_ALGORITHM, encryptionKey, iv);
 	encryptedPdu = cipher.update (scopedPdu);
@@ -1765,22 +1788,26 @@ var Session = function (target, authenticator, options) {
             ? options.reportOidMismatchErrors
             : false;
 
-	DEBUG = options.debug;
+	this.debug = options.debug;
 
 	this.engine = new Engine (options.engineID);
 	this.reqs = {};
 	this.reqCount = 0;
 
-	this.dgram = dgram.createSocket (this.transport);
-	this.dgram.unref();
-	
 	var me = this;
-	this.dgram.on ("message", me.onMsg.bind (me));
-	this.dgram.on ("close", me.onClose.bind (me));
-	this.dgram.on ("error", me.onError.bind (me));
-
-	if (this.sourceAddress || this.sourcePort)
+	if (this.debug) {
+		this.dgram = dgram.createSocket (this.transport);
+		this.dgram.unref();
+		
+		this.dgram.on ("message", me.onMsg.bind (me));
+		this.dgram.on ("close", me.onClose.bind (me));
+		
+		if (this.sourceAddress || this.sourcePort)
 		this.dgram.bind (this.sourcePort, this.sourceAddress);
+	}else{
+		this.dgram = options.transport
+	}
+	this.dgram.on ("error", me.onError.bind (me));
 };
 
 util.inherits (Session, events.EventEmitter);
@@ -2062,7 +2089,7 @@ Session.prototype.inform = function () {
 		{
 			oid: "1.3.6.1.2.1.1.3.0",
 			type: ObjectType.TimeTicks,
-			value: options.upTime || Math.floor (process.uptime () * 100)
+			value: options.upTime || 0
 		},
 		{
 			oid: "1.3.6.1.6.3.1.1.4.1.0",
@@ -2202,18 +2229,21 @@ Session.prototype.send = function (req, noWait) {
 		
 		var buffer = req.message.toBuffer ();
 
-		this.dgram.send (buffer, 0, buffer.length, req.port, this.target,
-				function (error, bytes) {
-			if (error) {
-				req.responseCb (error);
-			} else {
-				if (noWait) {
-					req.responseCb (null);
+		if (this.debug) {
+			this.dgram.send (buffer, 0, buffer.length, req.port, this.target, function (error, bytes) {
+				if (error) {
+					req.responseCb (error);
 				} else {
-					me.registerRequest (req);
+					if (noWait) {
+						req.responseCb (null);
+					} else {
+						me.registerRequest (req);
+					}
 				}
-			}
-		});
+			});
+		}else{
+			this.dgram.emit("send", buffer)
+		}
 	} catch (error) {
 		req.responseCb (error);
 	}
@@ -2520,7 +2550,7 @@ Session.prototype.trap = function () {
 			{
 				oid: "1.3.6.1.2.1.1.3.0",
 				type: ObjectType.TimeTicks,
-				value: options.upTime || Math.floor (process.uptime () * 100)
+				value: options.upTime || 0
 			},
 			{
 				oid: "1.3.6.1.6.3.1.1.4.1.0",
@@ -2750,14 +2780,15 @@ Engine.prototype.generateEngineID = function() {
 	// 0x80 | 0x00B983 (enterprise OID) | 0x80 (enterprise-specific format) | 12 bytes of random
 	this.engineID = Buffer.alloc (17);
 	this.engineID.fill ('8000B98380', 'hex', 0, 5);
-	this.engineID.fill (crypto.randomBytes (12), 5, 17, 'hex');
+	this.engineID.fill (randomBytes (12), 5, 17, 'hex');
 };
 
 var Listener = function (options, receiver) {
+	this.debug = options.debug
 	this.receiver = receiver;
 	this.callback = receiver.onMsg;
-	this.family = options.transport || 'udp4';
-	this.port = options.port || 161;
+	this.family = options.transport;
+	this.port = options.port;
 	this.address = options.address;
 	this.disableAuthorization = options.disableAuthorization || false;
 };
@@ -2765,25 +2796,30 @@ var Listener = function (options, receiver) {
 Listener.prototype.startListening = function () {
 	var me = this;
 	this.dgram = dgram.createSocket (this.family);
-	this.dgram.on ("error", me.receiver.callback);
-	this.dgram.bind (this.port, this.address);
-	this.dgram.on ("message", me.callback.bind (me.receiver));
+	if (this.debug) {
+		this.dgram.on ("error", me.receiver.callback);
+		this.dgram.bind (this.port, this.address);
+	}
+	this.dgram.on ("message", this.callback.bind(this.receiver)) 
 };
 
 Listener.prototype.send = function (message, rinfo) {
 	// var me = this;
 	
 	var buffer = message.toBuffer ();
-
-	this.dgram.send (buffer, 0, buffer.length, rinfo.port, rinfo.address,
+	if (this.debug) {
+		this.dgram.send (buffer, 0, buffer.length, rinfo.port, rinfo.address,
 			function (error, bytes) {
-		if (error) {
-			// me.callback (error);
-			console.error ("Error sending: " + error.message);
-		} else {
-			// debug ("Listener sent response message");
-		}
-	});
+				if (error) {
+					// me.callback (error);
+					console.error ("Error sending: " + error.message);
+				} else {
+					// debug ("Listener sent response message");
+				}
+			});
+	}else{
+		this.dgram.emit("send", buffer)
+	}
 };
 
 Listener.formatCallbackData = function (pdu, rinfo) {
@@ -3170,10 +3206,10 @@ ModuleStore.prototype.getSyntaxTypes = function () {
 	return syntaxTypes;
 };
 
-ModuleStore.prototype.loadFromFile = function (fileName) {
-	this.parser.Import (fileName);
-	this.parser.Serialize ();
-};
+// ModuleStore.prototype.loadFromFile = function (fileName) {
+// 	this.parser.Import (fileName);
+// 	this.parser.Serialize ();
+// };
 
 ModuleStore.prototype.getModule = function (moduleName) {
 	return this.parser.Modules[moduleName];
@@ -3360,12 +3396,15 @@ ModuleStore.prototype.getProvidersForModule = function (moduleName) {
 	return scalars.concat (tables);
 };
 
-ModuleStore.prototype.loadBaseModules = function () {
-	for ( var mibModule of ModuleStore.BASE_MODULES ) {
-		this.parser.Import (__dirname + "/lib/mibs/" + mibModule + ".mib");
-	}
-	this.parser.Serialize ();
-};
+// ModuleStore.prototype.loadBaseModules = function (path) {
+// 	for ( var mibModule of ModuleStore.BASE_MODULES ) {
+// 		FileData = fs.readFileSync(FileName).toString()
+
+// 		this.parser.Import (path + mibModule + ".mib");
+// 		// this.parser.Import (path + mibModule + ".mib");
+// 	}
+// 	this.parser.Serialize ();
+// };
 
 ModuleStore.getConstraintsFromSyntax = function (syntax, syntaxTypes) {
 	let constraints;
@@ -3400,22 +3439,14 @@ ModuleStore.getConstraintsFromSyntax = function (syntax, syntaxTypes) {
 	};
 };
 
-ModuleStore.create = function () {
+ModuleStore.create = function (modules, path) {
 	var store = new ModuleStore ();
-	store.loadBaseModules ();
+	ModuleStore.BASE_MODULES = modules;
+	// store.loadBaseModules (path);
 	return store;
 };
 
-ModuleStore.BASE_MODULES = [
-	"RFC1155-SMI",
-	"RFC1158-MIB",
-	"RFC-1212",
-	"RFC1213-MIB",
-	"SNMPv2-SMI",
-	"SNMPv2-CONF",
-	"SNMPv2-TC",
-	"SNMPv2-MIB"
-];
+ModuleStore.BASE_MODULES = [];
 
 var MibNode = function(address, parent) {
 	this.address = address;
@@ -4448,7 +4479,7 @@ MibRequest.prototype.isTabular = function () {
 };
 
 var Agent = function (options, callback, mib) {
-	DEBUG = options.debug;
+	this.debug = options.debug;
 	this.listener = new Listener (options, this);
 	this.engine = new Engine (options.engineID);
 	this.authorizer = new Authorizer (options);
@@ -4807,7 +4838,7 @@ Agent.prototype.isAllowed = function (pduType, provider, instanceNode) {
 	}
 };
 
-Agent.prototype.request = function (requestMessage, rinfo) {
+Agent.prototype.request = async function (requestMessage, rinfo) {
 	var me = this;
 	var varbindsCompleted = 0;
 	var requestPdu = requestMessage.pdu;
@@ -5107,7 +5138,7 @@ Agent.prototype.request = function (requestMessage, rinfo) {
 			};
 		})(i);
 		if ( handlers[i] ) {
-			handlers[i] (mibRequests[i]);
+			await handlers[i] (mibRequests[i]);
 		} else {
 			mibRequests[i].done ();
 		}
@@ -5812,7 +5843,7 @@ Subagent.prototype.notify = function (typeOrOid, varbinds, callback) {
 		{
 			oid: "1.3.6.1.2.1.1.3.0",
 			type: ObjectType.TimeTicks,
-			value: Math.floor (process.uptime () * 100)
+			value: 0
 		},
 		{
 			oid: "1.3.6.1.6.3.1.1.4.1.0",
